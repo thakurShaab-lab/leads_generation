@@ -1,0 +1,778 @@
+const express = require("express")
+const cors = require("cors")
+const db = require("./db")
+const { sql, eq } = require("drizzle-orm")
+const ExcelJS = require("exceljs")
+const scrapeBusinesses = require("./scrapper")
+const { leads, keywords } = require("./schema")
+
+const app = express()
+const PORT = 3003
+
+app.use(cors())
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+
+
+app.post("/add-keywords", async (req, res) => {
+    try {
+        const { keywordInput } = req.body
+
+        if (!keywordInput) {
+            return res.status(400).json({ success: false, message: "No keywords provided" })
+        }
+
+        const keywordList = keywordInput
+            .split(/,|\n/)
+            .map(k => k.trim())
+            .filter(Boolean)
+
+        if (keywordList.length === 0) {
+            return res.status(400).json({ success: false, message: "Empty keywords" })
+        }
+
+        const values = keywordList.map(k => ({ keyword: k }))
+        await db.insert(keywords).values(values)
+
+        res.json({ success: true, message: `Added ${keywordList.length} keyword(s)` })
+
+    } catch (err) {
+        console.error("ADD KEYWORDS ERROR:", err)
+        res.status(500).json({ success: false, message: "Error adding keywords: " + err.message })
+    }
+})
+
+app.get("/get-keywords", async (req, res) => {
+    try {
+        const list = await db.select().from(keywords)
+        res.json(list)
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+app.get("/leads-count", async (req, res) => {
+    try {
+        const result = await db.select({ count: sql`count(*)` }).from(leads)
+        res.json({ count: Number(result[0].count) })
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+app.delete("/delete-keyword/:id", async (req, res) => {
+    try {
+        await db.delete(keywords).where(eq(keywords.id, parseInt(req.params.id)))
+        res.json({ success: true })
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+app.post("/run-keyword-scraper", async (req, res) => {
+    try {
+        const keywordsList = await db.select().from(keywords)
+
+        if (keywordsList.length === 0) {
+            return res.json({ success: false, message: "No keywords saved in database" })
+        }
+
+        res.json({ success: true, message: `Started scraping ${keywordsList.length} keyword(s)...` })
+
+        ;(async () => {
+            for (let k of keywordsList) {
+                if (!k.keyword) continue
+                const parts = k.keyword.split(" in ")
+                const keywordPart = parts[0]
+                const locationPart = parts[1]
+                if (!keywordPart || !locationPart) {
+                    console.log(`Skipping "${k.keyword}" - format must be "Term in City"`)
+                    continue
+                }
+                console.log(`Scraping: ${k.keyword}`)
+                await scrapeBusinesses(keywordPart, [locationPart])
+            }
+            console.log("All keyword scraping done")
+        })()
+
+    } catch (err) {
+        console.error("SCRAPER ERROR:", err)
+        res.status(500).json({ success: false, message: "Error: " + err.message })
+    }
+})
+
+app.post("/run-selected-keywords", async (req, res) => {
+    try {
+        const { keywords: selectedKeywords } = req.body
+
+        if (!Array.isArray(selectedKeywords) || selectedKeywords.length === 0) {
+            return res.json({ success: false, message: "No keywords provided" })
+        }
+
+        const valid = []
+        const skipped = []
+
+        for (const kw of selectedKeywords) {
+            const parts = kw.split(" in ")
+            if (!parts[0] || !parts[1]) {
+                skipped.push(kw)
+            } else {
+                valid.push({ keyword: kw, keywordPart: parts[0].trim(), locationPart: parts[1].trim() })
+            }
+        }
+
+        if (valid.length === 0) {
+            return res.json({ success: false, message: 'All keywords have invalid format. Must be "Term in City"' })
+        }
+
+        res.json({
+            success: true,
+            message: `Started scraping ${valid.length} keyword(s)...` + (skipped.length ? ` Skipped: ${skipped.join(", ")}` : "")
+        })
+
+        ;(async () => {
+            for (const item of valid) {
+                console.log(`Scraping: ${item.keyword}`)
+                await scrapeBusinesses(item.keywordPart, [item.locationPart])
+                console.log(`Done: ${item.keyword}`)
+            }
+            console.log("Selected keyword scraping done")
+        })()
+
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+    }
+})
+
+app.post("/run-manual-scrape", async (req, res) => {
+    try {
+        const { keyword, location } = req.body
+        if (!keyword || !location) {
+            return res.json({ success: false, message: "Keyword and location are required" })
+        }
+        const locations = location.split(",").map(l => l.trim()).filter(Boolean)
+
+        res.json({ success: true, message: `Scraping "${keyword}" in ${locations.join(", ")}...` })
+
+        ;(async () => {
+            console.log(`Manual scrape: ${keyword} in ${locations.join(", ")}`)
+            await scrapeBusinesses(keyword, locations)
+            console.log(`Manual scrape done`)
+        })()
+
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message })
+    }
+})
+
+app.get("/export-leads", async (req, res) => {
+  try {
+    const { city } = req.query
+
+    let query = db.select().from(leads)
+
+    if (city) {
+      query = query.where(eq(leads.city, city))
+    }
+
+    const allLeads = await query
+
+    if (!allLeads.length) {
+      return res.status(404).send("No leads found")
+    }
+
+    const workbook = new ExcelJS.Workbook()
+    const sheet = workbook.addWorksheet("Leads")
+
+    // Columns
+    sheet.columns = [
+      { header: "Name", key: "name", width: 30 },
+      { header: "Keyword", key: "keyword", width: 25 },
+      { header: "City", key: "city", width: 20 },
+      { header: "Phone", key: "phone", width: 20 },
+      { header: "Website", key: "website", width: 30 }
+    ]
+
+    // Add rows
+    allLeads.forEach(l => {
+      sheet.addRow({
+        name: l.name || "",
+        keyword: l.keyword || "",
+        city: l.city || "",
+        phone: l.phone || "",
+        website: l.website || ""
+      })
+    })
+
+    // Styling (optional but nice)
+    sheet.getRow(1).font = { bold: true }
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    const fileName = city
+      ? `leads_${city}.xlsx`
+      : `all_leads.xlsx`
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=${fileName}`
+    )
+
+    await workbook.xlsx.write(res)
+    res.end()
+
+  } catch (err) {
+    console.error("EXPORT ERROR:", err)
+    res.status(500).send("Error exporting leads")
+  }
+})
+
+function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, citiesList, selectedCity) {
+
+  const rows = data.map((l, i) => {
+    const num = (page - 1) * 10 + i + 1
+    const name = (l.name || "").replace(/</g, "&lt;")
+    const kw   = (l.keyword || "").replace(/</g, "&lt;")
+    const city = (l.city || "").replace(/</g, "&lt;")
+    const phone = (l.phone || "").replace(/</g, "&lt;")
+    const website = l.website
+      ? '<a href="' + l.website + '" target="_blank">Visit</a>'
+      : "&mdash;"
+    return "<tr><td>" + num + "</td><td>" + (name||"&mdash;") + "</td><td>" + (kw||"&mdash;") + "</td><td>" + (city||"&mdash;") + "</td><td>" + (phone||"&mdash;") + "</td><td>" + website + "</td></tr>"
+  }).join("")
+
+  const cityOptions = citiesList.map(city =>
+    '<option value="' + city + '"' + (selectedCity === city ? " selected" : "") + ">" + city + "</option>"
+  ).join("")
+
+  const maxVisible = 5
+  let startPage = Math.max(1, page - Math.floor(maxVisible / 2))
+  let endPage = startPage + maxVisible - 1
+  if (endPage > totalPages) {
+    endPage = totalPages
+    startPage = Math.max(1, endPage - maxVisible + 1)
+  }
+
+  const extraParams =
+    (selectedCity ? "&filterCity=" + selectedCity : "") +
+    (keyword ? "&keyword=" + encodeURIComponent(keyword) : "") +
+    (locationInput ? "&location=" + encodeURIComponent(locationInput) : "")
+
+  let pageLinks = ""
+  if (page > 1) pageLinks += `<a href="?page=${page - 1}${extraParams}">&larr; Prev</a>`
+  for (let i = startPage; i <= endPage; i++) {
+    pageLinks += i === page
+      ? `<a class="active">${i}</a>`
+      : `<a href="?page=${i}${extraParams}">${i}</a>`
+  }
+  if (page < totalPages) pageLinks += `<a href="?page=${page + 1}${extraParams}">Next &rarr;</a>`
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <title>Business Scraper</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
+    h2 { color: #111; }
+    h3 { color: #333; margin-top: 0; }
+    .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 280px; }
+    input[type=text], input:not([type]), textarea, select { padding: 9px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 8px; }
+    button { padding: 9px 18px; background: #111; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; margin-right: 6px; margin-top: 4px; }
+    button:hover { background: #333; }
+    button.secondary { background: #555; }
+    button.danger { background: #c0392b; }
+    button.success { background: #27ae60; }
+    a { text-decoration: none; color: #2980b9; }
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #111; color: white; padding: 10px; text-align: left; }
+    td { border-bottom: 1px solid #eee; padding: 10px; font-size: 14px; }
+    tr:hover td { background: #fafafa; }
+    .pagination { margin-top: 16px; }
+    .pagination a { padding: 6px 14px; background: #eee; border-radius: 4px; margin: 0 4px; color: #111; display: inline-block; }
+    .pagination a.active { background: #111; color: white; font-weight: bold; }
+    .status-bar { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; border-radius: 6px; padding: 10px 16px; margin-bottom: 16px; display: none; font-size: 14px; }
+    .status-bar.error { background: #f8d7da; color: #721c24; border-color: #f5c6cb; }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; }
+    .modal { background: white; border-radius: 12px; padding: 28px; width: 460px; max-width: 95vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+    .modal h3 { margin-top: 0; }
+    .modal-close { float: right; background: none; border: none; font-size: 20px; cursor: pointer; color: #555; padding: 0; margin: 0; }
+    .modal-close:hover { color: #111; background: none; }
+    .section-label { font-size: 12px; font-weight: bold; text-transform: uppercase; color: #888; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .divider { border: none; border-top: 1px solid #eee; margin: 20px 0; }
+
+    /* Checkbox keyword list */
+    .keyword-list { max-height: 200px; overflow-y: auto; border: 1px solid #ccc; border-radius: 6px; padding: 4px 10px; margin-bottom: 8px; background: #fafafa; }
+    .keyword-list label { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 14px; cursor: pointer; border-bottom: 1px solid #eee; }
+    .keyword-list label:last-child { border-bottom: none; }
+    .keyword-list input[type=checkbox] { width: 15px; height: 15px; min-width: 15px; margin: 0; padding: 0; cursor: pointer; accent-color: #111; }
+    .keyword-list-empty { font-size: 13px; color: #888; padding: 8px 0; }
+    .kw-select-all-row { display: flex; gap: 10px; margin-bottom: 6px; font-size: 13px; align-items: center; }
+    .kw-select-all-row a { cursor: pointer; color: #2980b9; text-decoration: underline; }
+    .kw-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+
+    /* Loader */
+    #loaderOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: none; align-items: center; justify-content: center; z-index: 2000; }
+    .loader-box { background: white; padding: 30px 36px; border-radius: 12px; text-align: center; min-width: 240px; }
+    .spinner { width: 40px; height: 40px; border: 4px solid #ddd; border-top: 4px solid #111; border-radius: 50%; animation: spin 0.9s linear infinite; margin: 0 auto 14px; }
+    @keyframes spin { 100% { transform: rotate(360deg); } }
+    #loaderText { font-size: 14px; color: #333; }
+  </style>
+</head>
+<body>
+
+  <!-- LOADER OVERLAY -->
+  <div id="loaderOverlay">
+    <div class="loader-box">
+      <div class="spinner"></div>
+      <div id="loaderText">Processing...</div>
+    </div>
+  </div>
+
+  <h2>&#128640; Business Scraper Dashboard</h2>
+  <div class="status-bar" id="statusBar"></div>
+
+  <div class="row">
+    <!-- KEYWORD MANAGEMENT -->
+    <div class="col card">
+      <h3>&#128278; Keyword Management</h3>
+      <div class="section-label">Saved Keywords</div>
+      <div class="kw-select-all-row">
+        <a onclick="selectAllKeywords()">Select All</a>
+        <span style="color:#ccc;">|</span>
+        <a onclick="deselectAllKeywords()">Deselect All</a>
+        <span id="selectedCount" style="margin-left:auto;color:#555;font-size:12px;">0 selected</span>
+      </div>
+      <div class="keyword-list" id="keywordList">
+        <div class="keyword-list-empty">Loading...</div>
+      </div>
+      <div class="kw-actions">
+        <button onclick="searchSelectedKeywords()">&#128269; Search Selected</button>
+        <button class="danger" onclick="deleteSelectedKeyword()">&#128465; Delete</button>
+      </div>
+      <hr class="divider" style="margin: 14px 0;">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button onclick="openModal()">&#10133; Add Keywords</button>
+        <button class="success" onclick="runAllKeywords()">&#9654; Run All</button>
+        <button onclick="openKeywordViewer()">👁 View All Keywords</button>
+      </div>
+    </div>
+
+    <!-- MANUAL SEARCH -->
+    <div class="col card">
+      <h3>&#128269; Manual Search</h3>
+      <div class="section-label">Enter keyword &amp; location to scrape now</div>
+      <input type="text" id="manualKeyword" placeholder="e.g. Doctor" value="${keyword || ""}" />
+      <input type="text" id="manualLocation" placeholder="e.g. Delhi, Gurgaon" value="${locationInput || ""}" />
+      <button onclick="handleManualSearch()">Search &amp; Scrape</button>
+      <hr class="divider">
+      <div class="section-label">Filter leads by city</div>
+      <form method="GET">
+        <select name="filterCity">
+          <option value="">All Cities</option>
+          ${cityOptions}
+        </select>
+        <button type="submit" style="margin-top:8px;">Filter</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- LEADS TABLE -->
+  <div class="card">
+    <h3>&#128203; Leads &nbsp;<span style="font-weight:normal;font-size:15px;color:#555;">(Total: ${totalLeads})</span></h3>
+    <div style="float:right;display:flex;gap:8px;margin-bottom:10px">
+    <button onclick="downloadAllLeads()">Export All Data</button>
+    <button onclick="downloadCityLeads()">Export By City</button>
+  </div>
+    ⬇ Download EXCEL File
+  </button>
+    <table>
+      <tr><th>#</th><th>Name</th><th>Keyword</th><th>City</th><th>Phone</th><th>Website</th></tr>
+      ${data.length === 0 ? '<tr><td colspan="6" style="text-align:center;color:#888;padding:30px;">No leads found</td></tr>' : rows}
+    </table>
+    <div class="pagination">${pageLinks}</div>
+  </div>
+
+  <!-- ADD KEYWORDS MODAL -->
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal">
+      <button class="modal-close" onclick="closeModal()">&#10005;</button>
+      <h3>&#10133; Add Keywords</h3>
+      <p style="color:#555;font-size:14px;margin-top:0;">
+        Format: <code>Business Type in City</code><br>
+        e.g. <em>Doctor in Delhi, Dentist in Gurgaon</em><br>
+        One per line or comma-separated.
+      </p>
+      <textarea id="keywordInput" placeholder="Doctor in Delhi" style="height:120px;"></textarea>
+      <div style="margin-top:12px;">
+        <button onclick="submitKeywords()">Save Keywords</button>
+        <button class="secondary" onclick="closeModal()">Cancel</button>
+      </div>
+      <div id="modalStatus" style="margin-top:12px;font-size:14px;"></div>
+    </div>
+  </div>
+
+  <!-- VIEW KEYWORDS MODAL -->
+<div class="modal-overlay" id="keywordViewerOverlay">
+  <div class="modal">
+    <button class="modal-close" onclick="closeKeywordViewer()">✕</button>
+    <h3>📋 All Saved Keywords</h3>
+
+    <div id="keywordViewerList" style="max-height:300px; overflow-y:auto; margin-top:10px;">
+      Loading...
+    </div>
+
+    <div style="margin-top:15px;">
+      <button onclick="closeKeywordViewer()">Close</button>
+    </div>
+  </div>
+</div>
+
+  <script>
+    // BASE must be declared first — all fetch calls depend on it
+    var pathSegs = window.location.pathname.split('/').filter(function(s){ return s.length > 0; });
+    var BASE = pathSegs.length > 0 ? '/' + pathSegs[0] : '';
+
+    // ── Loader ──
+    function showLoader(text) {
+      document.getElementById('loaderOverlay').style.display = 'flex';
+      document.getElementById('loaderText').textContent = text || 'Processing...';
+    }
+    function hideLoader() {
+      document.getElementById('loaderOverlay').style.display = 'none';
+    }
+    function updateLoaderText(text) {
+      document.getElementById('loaderText').textContent = text;
+    }
+
+    // ── Status bar ──
+    function showStatus(msg, isError) {
+      var bar = document.getElementById('statusBar');
+      bar.textContent = msg;
+      bar.style.display = 'block';
+      bar.className = 'status-bar' + (isError ? ' error' : '');
+      clearTimeout(window._st);
+      window._st = setTimeout(function(){ bar.style.display = 'none'; }, 8000);
+    }
+
+    // ── Poll until lead count grows, then reload ──
+    // baselineCount: the count before scraping started
+    // labelText: shown in the loader while polling
+    // timeoutMs: give up after this many ms (default 5 min)
+    function pollUntilNewData(baselineCount, labelText, timeoutMs) {
+      var deadline = Date.now() + (timeoutMs || 300000); // 5 min max
+      var dots = 0;
+
+      function tick() {
+        dots = (dots + 1) % 4;
+        var dotStr = '.'.repeat(dots + 1);
+        updateLoaderText((labelText || 'Scraping') + dotStr);
+
+        if (Date.now() > deadline) {
+          hideLoader();
+          showStatus('Scraping timed out. Reloading to show latest data.', true);
+          setTimeout(function(){ location.reload(); }, 1500);
+          return;
+        }
+
+        fetch(BASE + '/leads-count')
+          .then(function(r){ return r.json(); })
+          .then(function(data) {
+            if (data.count > baselineCount) {
+              // New records found — reload page to show them
+              updateLoaderText('Loading new data...');
+              location.reload();
+            } else {
+              // Not yet — check again in 2s
+              setTimeout(tick, 2000);
+            }
+          })
+          .catch(function() {
+            // Network blip — retry
+            setTimeout(tick, 3000);
+          });
+      }
+
+      setTimeout(tick, 2000); // first check after 2s
+    }
+
+    // ── Get current lead count then run a scrape action ──
+    // action: function(baselineCount) — should start the scrape, returns a Promise<{success, message}>
+    // loaderText: text shown while scraping
+    function scrapeWithPolling(action, loaderText) {
+      showLoader('Starting...');
+      // Step 1: snapshot current count
+      fetch(BASE + '/leads-count')
+        .then(function(r){ return r.json(); })
+        .then(function(countData) {
+          var baseline = countData.count;
+          // Step 2: fire the scrape
+          return action().then(function(result) {
+            if (!result.success) {
+              hideLoader();
+              showStatus('Error: ' + result.message, true);
+              return;
+            }
+            // Step 3: poll until count grows
+            showLoader(loaderText || 'Scraping');
+            pollUntilNewData(baseline, loaderText || 'Scraping');
+          });
+        })
+        .catch(function(e) {
+          hideLoader();
+          showStatus('Network error: ' + e.message, true);
+        });
+    }
+
+    // ── Load keywords as checkboxes ──
+    function loadKeywords() {
+      fetch(BASE + '/get-keywords')
+        .then(function(r){ return r.json(); })
+        .then(function(list) {
+          var container = document.getElementById('keywordList');
+          if (!list.length) {
+            container.innerHTML = '<div class="keyword-list-empty">No keywords saved yet</div>';
+            updateSelectedCount();
+            return;
+          }
+          container.innerHTML = '';
+          list.forEach(function(k) {
+            var label = document.createElement('label');
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = k.keyword;
+            cb.dataset.id = k.id;
+            cb.addEventListener('change', updateSelectedCount);
+            label.appendChild(cb);
+            label.appendChild(document.createTextNode(' ' + k.keyword));
+            container.appendChild(label);
+          });
+          updateSelectedCount();
+        })
+        .catch(function(e){ console.error('loadKeywords error:', e); });
+    }
+
+    function getCheckedKeywords() {
+      return Array.from(document.querySelectorAll('#keywordList input[type=checkbox]:checked'))
+        .map(function(cb){ return cb.value; });
+    }
+
+    function updateSelectedCount() {
+      var n = document.querySelectorAll('#keywordList input[type=checkbox]:checked').length;
+      document.getElementById('selectedCount').textContent = n + ' selected';
+    }
+
+    function selectAllKeywords() {
+      document.querySelectorAll('#keywordList input[type=checkbox]').forEach(function(cb){ cb.checked = true; });
+      updateSelectedCount();
+    }
+
+    function deselectAllKeywords() {
+      document.querySelectorAll('#keywordList input[type=checkbox]').forEach(function(cb){ cb.checked = false; });
+      updateSelectedCount();
+    }
+
+    loadKeywords();
+
+    // ── Modal ──
+    function openModal() {
+      document.getElementById('modalOverlay').style.display = 'flex';
+      document.getElementById('keywordInput').value = '';
+      document.getElementById('modalStatus').textContent = '';
+    }
+    function closeModal() {
+      document.getElementById('modalOverlay').style.display = 'none';
+    }
+    document.getElementById('modalOverlay').addEventListener('click', function(e) {
+      if (e.target === this) closeModal();
+    });
+
+    function submitKeywords() {
+      var val = document.getElementById('keywordInput').value.trim();
+      var status = document.getElementById('modalStatus');
+      if (!val) { status.textContent = 'Please enter at least one keyword.'; return; }
+      status.textContent = 'Saving...';
+      fetch(BASE + '/add-keywords', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keywordInput: val })
+      })
+      .then(function(r){ return r.json(); })
+      .then(function(data) {
+        if (data.success) {
+          status.style.color = 'green';
+          status.textContent = 'Saved! ' + data.message;
+          loadKeywords();
+          setTimeout(closeModal, 1200);
+        } else {
+          status.style.color = 'red';
+          status.textContent = 'Error: ' + data.message;
+        }
+      })
+      .catch(function(e){
+        status.style.color = 'red';
+        status.textContent = 'Network error: ' + e.message;
+      });
+    }
+
+    // ── Search selected keyword(s) with live polling ──
+    function searchSelectedKeywords() {
+      var selected = getCheckedKeywords();
+      if (selected.length === 0) {
+        showStatus('Please check at least one keyword first.', true);
+        return;
+      }
+      var label = 'Scraping ' + selected.length + ' keyword' + (selected.length > 1 ? 's' : '');
+      scrapeWithPolling(function() {
+        return fetch(BASE + '/run-selected-keywords', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keywords: selected })
+        }).then(function(r){ return r.json(); });
+      }, label);
+    }
+
+    // ── Delete checked keyword(s) ──
+    function deleteSelectedKeyword() {
+      var checked = Array.from(document.querySelectorAll('#keywordList input[type=checkbox]:checked'));
+      if (checked.length === 0) { showStatus('Please check at least one keyword to delete.', true); return; }
+      if (!confirm('Delete ' + checked.length + ' keyword(s)?')) return;
+      var i = 0;
+      function deleteNext() {
+        if (i >= checked.length) { showStatus('Deleted ' + checked.length + ' keyword(s).'); loadKeywords(); return; }
+        fetch(BASE + '/delete-keyword/' + checked[i].dataset.id, { method: 'DELETE' })
+          .then(function(r){ return r.json(); })
+          .then(function(){ i++; deleteNext(); })
+          .catch(function(e){ showStatus('Error deleting: ' + e.message, true); });
+      }
+      deleteNext();
+    }
+
+    // ── Run ALL saved keywords with live polling ──
+    function runAllKeywords() {
+      if (!confirm('Run scraper for ALL saved keywords?')) return;
+      scrapeWithPolling(function() {
+        return fetch(BASE + '/run-keyword-scraper', { method: 'POST' })
+          .then(function(r){ return r.json(); });
+      }, 'Scraping all keywords');
+    }
+
+    // ── Manual search with live polling ──
+    function handleManualSearch() {
+      var kw = document.getElementById('manualKeyword').value.trim();
+      var loc = document.getElementById('manualLocation').value.trim();
+      if (!kw || !loc) {
+        showStatus('Please enter both a keyword and a location.', true);
+        return;
+      }
+      scrapeWithPolling(function() {
+        return fetch(BASE + '/run-manual-scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keyword: kw, location: loc })
+        }).then(function(r){ return r.json(); });
+      }, 'Scraping "' + kw + '" in ' + loc);
+    }
+
+    // ── Keyword Viewer ──
+function openKeywordViewer() {
+  const overlay = document.getElementById('keywordViewerOverlay')
+  overlay.style.display = 'flex'
+
+  // close on outside click
+  overlay.onclick = function(e) {
+    if (e.target === overlay) closeKeywordViewer()
+  }
+
+  loadKeywordViewer()
+}
+
+function closeKeywordViewer() {
+  document.getElementById('keywordViewerOverlay').style.display = 'none'
+}
+
+function loadKeywordViewer() {
+  const container = document.getElementById('keywordViewerList')
+  container.innerHTML = 'Loading...'
+
+  fetch(BASE + '/get-keywords')
+    .then(function(r) { return r.json() })
+    .then(function(list) {
+
+      if (!list.length) {
+        container.innerHTML = '<div style="color:#888;">No keywords found</div>'
+        return
+      }
+
+      container.innerHTML = list.map(function(k, i) {
+        return '<div style="padding:8px;border-bottom:1px solid #eee;">' +
+          '<strong>' + (i + 1) + '.</strong> ' + k.keyword +
+          '</div>'
+      }).join('')
+    })
+    .catch(function() {
+      container.innerHTML = '<div style="color:red;">Error loading keywords</div>'
+    })
+}
+
+function downloadAllLeads() {
+  window.open(BASE + "/export-leads", "_blank")
+}
+
+function downloadCityLeads() {
+  const city = document.querySelector("select[name='filterCity']").value
+
+  if (!city) {
+    showStatus("Please select a city first", true)
+    return
+  }
+
+  window.open(BASE + "/export-leads?city=" + encodeURIComponent(city), "_blank")
+}
+  </script>
+</body>
+</html>`
+}
+
+app.get("/", async (req, res) => {
+  const keyword = req.query.keyword
+  const locationInput = req.query.location
+  const filterCity = req.query.filterCity
+
+  const page = parseInt(req.query.page) || 1
+  const limit = 10
+
+  try {
+    const citiesResult = await db.select({ city: leads.city }).from(leads)
+    const citiesList = [...new Set(citiesResult.map(c => c.city).filter(Boolean))]
+
+    let query = db.select().from(leads)
+    let countQuery = db.select({ count: sql`count(*)` }).from(leads)
+
+    if (filterCity) {
+      query = query.where(eq(leads.city, filterCity))
+      countQuery = countQuery.where(eq(leads.city, filterCity))
+    }
+
+    const totalResult = await countQuery
+    const totalLeads = Number(totalResult[0].count)
+    const totalPages = Math.ceil(totalLeads / limit) || 1
+
+    const result = await query.limit(limit).offset((page - 1) * limit)
+
+    res.send(renderHTML(result, totalLeads, page, totalPages, keyword, locationInput, citiesList, filterCity))
+
+  } catch (err) {
+    console.error(err)
+    res.send(`<h3>Error</h3><pre>${err.message}</pre>`)
+  }
+})
+
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`Server running on http://127.0.0.1:${PORT}`)
+})
