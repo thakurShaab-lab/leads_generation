@@ -3,7 +3,7 @@
 const express = require("express")
 const cors = require("cors")
 const db = require("./db")
-const { sql, eq, gte, lte, and, like } = require("drizzle-orm")
+const { sql, eq, gte, lte, and, like, inArray } = require("drizzle-orm")
 const ExcelJS = require("exceljs")
 const scrapeBusinesses = require("./scrapper")
 const { leads, keywords, admin } = require("./schema")
@@ -59,23 +59,28 @@ function isAllowedIP(req) {
 
 function parseKeyword(input) {
   if (!input) return null
+
   input = input.trim()
+
   if (input.toLowerCase().includes(" in ")) {
     const parts = input.split(/ in /i)
-    return { keywordPart: parts[0].trim(), locationPart: parts[1].trim() }
-  }
-  const words = input.split(/\s+/)
-  if (words.length < 2) return null
-  for (let i = 3; i >= 1; i--) {
-    if (words.length > i) {
-      const locationPart = words.slice(-i).join(" ")
-      const keywordPart = words.slice(0, -i).join(" ")
-      if (keywordPart.length > 2 && locationPart.length > 2) {
-        return { keywordPart, locationPart }
-      }
+    return {
+      keywordPart: parts[0].trim(),
+      locationPart: parts[1].trim()
     }
   }
-  return null
+
+  const words = input.split(/\s+/)
+
+  if (words.length < 2) return null
+
+  const locationPart = words[words.length - 1]
+  const keywordPart = words.slice(0, -1).join(" ")
+
+  return {
+    keywordPart,
+    locationPart
+  }
 }
 
 function getTokenFromCookie(req) {
@@ -187,12 +192,12 @@ app.get(BASE_PATH + "/get-keywords", requireAuth, async (req, res) => {
 })
 
 app.get("/leads-count", async (req, res) => {
-    try {
-        const result = await db.select({ count: sql`count(*)` }).from(leads)
-        res.json({ count: Number(result[0].count) })
-    } catch (err) {
-        res.status(500).json({ error: err.message })
-    }
+  try {
+    const result = await db.select({ count: sql`count(*)` }).from(leads)
+    res.json({ count: Number(result[0].count) })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.delete(BASE_PATH + "/delete-keyword/:id", requireAuth, async (req, res) => {
@@ -215,7 +220,7 @@ app.post(BASE_PATH + "/run-keyword-scraper", requireAuth, async (req, res) => {
         const parsed = parseKeyword(k.keyword)
         if (!parsed) { console.log(`Skipping "${k.keyword}" - invalid format`); continue }
         console.log(`Scraping: ${k.keyword}`)
-        await scrapeBusinesses(parsed.keywordPart, [parsed.locationPart])
+        await scrapeBusinesses(parsed.keywordPart, [parsed.locationPart], k.id)
       }
       console.log("All keyword scraping done")
     })()
@@ -230,11 +235,16 @@ app.post(BASE_PATH + "/run-selected-keywords", requireAuth, async (req, res) => 
     const { keywords: selectedKeywords } = req.body
     if (!Array.isArray(selectedKeywords) || selectedKeywords.length === 0)
       return res.json({ success: false, message: "No keywords provided" })
+
+    const dbKeywords = await db.select().from(keywords);
+    const keywordMap = {};
+    dbKeywords.forEach(k => keywordMap[k.keyword] = k.id);
+
     const valid = [], skipped = []
     for (const kw of selectedKeywords) {
       const parsed = parseKeyword(kw)
       if (!parsed) skipped.push(kw)
-      else valid.push({ keyword: kw, keywordPart: parsed.keywordPart, locationPart: parsed.locationPart })
+      else valid.push({ keyword: kw, keywordPart: parsed.keywordPart, locationPart: parsed.locationPart, keywordId: keywordMap[kw] })
     }
     if (valid.length === 0) return res.json({ success: false, message: 'All keywords have invalid format. Must be "Term in City"' })
     res.json({
@@ -244,7 +254,7 @@ app.post(BASE_PATH + "/run-selected-keywords", requireAuth, async (req, res) => 
     (async () => {
       for (const item of valid) {
         console.log(`Scraping: ${item.keyword}`)
-        await scrapeBusinesses(item.keywordPart, [item.locationPart])
+        await scrapeBusinesses(item.keywordPart, [item.locationPart], item.keywordId)
         console.log(`Done: ${item.keyword}`)
       }
       console.log("Selected keyword scraping done")
@@ -270,7 +280,7 @@ app.post(BASE_PATH + "/run-manual-scrape", requireAuth, async (req, res) => {
     res.json({ success: true, message: `Scraping "${keyword}" in ${locations.join(", ")}...` });
     (async () => {
       console.log(`Manual scrape: ${finalKeyword} in ${locations.join(", ")}`)
-      await scrapeBusinesses(finalKeyword, locations)
+      await scrapeBusinesses(finalKeyword, locations, null)
       console.log(`Manual scrape done`)
     })()
   } catch (err) {
@@ -304,10 +314,25 @@ function buildConditions(filterCity, filterKeyword, fromDate, toDate) {
 // ── Export endpoint ───────────────────────────────────────────────────────────
 app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
   try {
-    const { city, filterKeyword, fromDate, toDate } = req.query
+    const { keywordIds, fromDate, toDate } = req.query
 
-    // ✅ Use the shared buildConditions helper (city param = filterCity for export)
-    const conditions = buildConditions(city, filterKeyword, fromDate, toDate)
+    const conditions = []
+
+    if (keywordIds) {
+      const ids = keywordIds.split(',').map(Number).filter(Boolean)
+
+      if (ids.length > 0) {
+        conditions.push(inArray(leads.keyword_id, ids))
+      }
+    }
+
+    if (fromDate) {
+      conditions.push(sql`DATE(${leads.created_at}) >= ${fromDate}`)
+    }
+
+    if (toDate) {
+      conditions.push(sql`DATE(${leads.created_at}) <= ${toDate}`)
+    }
 
     let query = db.select().from(leads)
     if (conditions.length) {
@@ -316,7 +341,12 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
 
     const allLeads = await query
 
-    if (!allLeads.length) return res.status(404).send("No leads found for the selected filters")
+    if (!allLeads.length) {
+      return res.json({
+        success: false,
+        message: "No leads found for the selected filters"
+      })
+    }
 
     const workbook = new ExcelJS.Workbook()
     const sheet = workbook.addWorksheet("Leads")
@@ -343,15 +373,18 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
 
     sheet.getColumn("date").numFmt = "dd-mmm-yyyy hh:mm"
 
-    // Bold header row
     sheet.getRow(1).font = { bold: true }
 
-    // ✅ Dynamic filename reflecting active filters
     let fileName = "leads"
+
+    const city = req.query.city
+    const filterKeyword = req.query.filterKeyword
+
     if (city) fileName += "_" + city
     if (filterKeyword) fileName += "_" + filterKeyword.replace(/\s+/g, "_")
     if (fromDate) fileName += "_from_" + fromDate
     if (toDate) fileName += "_to_" + toDate
+
     fileName += ".xlsx"
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -530,7 +563,6 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
     <h2>&#128640; Business Scraper Dashboard</h2>
     <div style="display:flex;gap:10px;align-items:center;">
-      <button onclick="openFilterModal()" style="background:#2980b9;padding:8px 16px;font-size:13px;border-radius:20px;">🔍 Filters</button>
       <form method="POST" action="${BASE_PATH}/logout" style="margin:0;">
         <button type="submit" style="background:#c0392b;padding:8px 16px;font-size:13px;">&#128274; Logout</button>
       </form>
@@ -586,7 +618,7 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
     <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
       <h3 style="margin:0;">&#128203; Leads &nbsp;<span style="font-weight:normal;font-size:15px;color:#555;">(Total: ${totalLeads})</span></h3>
       <div style="display:flex;gap:8px;">
-        <button onclick="downloadFilteredLeads()">⬇ Export Filtered</button>
+        <button onclick="openFilterModal()">⬇ Export Filtered</button>
         <button onclick="downloadAllLeads()">⬇ Export All</button>
       </div>
     </div>
@@ -609,7 +641,10 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
         <button onclick="submitKeywords()">Save Keywords</button>
         <button class="secondary" onclick="closeModal()">Cancel</button>
       </div>
-      <div id="modalStatus" style="margin-top:12px;font-size:14px;"></div>
+      <div style="margin-top:15px;">
+  <button onclick="exportFilteredLeads()">Export</button>
+  <button class="secondary" onclick="closeFilterModal()">Cancel</button>
+</div>
     </div>
   </div>
 
@@ -627,23 +662,147 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
   <div class="modal-overlay" id="filterModal">
     <div class="modal">
       <button class="modal-close" onclick="closeFilterModal()">✕</button>
-      <h3>🔍 Filter Leads</h3>
-      <label>Keyword</label>
-      <input type="text" id="filterKeyword" placeholder="e.g. Doctor" value="${filterKeyword || ""}" />
+      <h3>⬇ Export Leads</h3>
+      <label>Select Keywords</label>
+      <div style="font-size:13px;margin-bottom:6px;">
+  <a onclick="selectAllExportKeywords()" style="cursor:pointer;color:#2980b9;">Select All</a>
+  |
+  <a onclick="deselectAllExportKeywords()" style="cursor:pointer;color:#2980b9;">Deselect All</a>
+</div>
+      <div id="exportKeywordsList" class="keyword-list">
+  <div class="keyword-list-empty">Loading...</div>
+</div>
       <label>From Date</label>
       <input type="date" id="fromDate" value="${fromDate || ""}" />
       <label>To Date</label>
       <input type="date" id="toDate" value="${toDate || ""}" />
       <div style="margin-top:15px;">
-        <button onclick="applyFilters()">Apply</button>
-        <button class="secondary" onclick="clearFilters()">Clear All</button>
+        <button onclick="exportFilteredLeads()">Export</button>
         <button class="secondary" onclick="closeFilterModal()">Cancel</button>
       </div>
+      <div id="modalStatus" style="margin-top:10px;font-size:14px;"></div>
     </div>
   </div>
 
   <script>
   var BASE = '/leads';
+
+  function loadKeywordDropdown() {
+  fetch(BASE + '/get-keywords')
+    .then(r => r.json())
+    .then(list => {
+      const container = document.getElementById('exportKeywordsList');
+
+      if (!list.length) {
+        container.innerHTML = '<div class="keyword-list-empty">No keywords found</div>';
+        return;
+      }
+
+      container.innerHTML = '';
+
+      list.forEach(k => {
+        const label = document.createElement('label');
+
+        label.style.cssText =
+          "display:flex;" +
+          "align-items:center;" +
+          "gap:8px;" +
+          "padding:6px 0;" +
+          "border-bottom:1px solid #eee;" +
+          "cursor:pointer;";
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = k.id;
+
+        const text = document.createElement('span');
+        text.textContent = k.keyword;
+
+        label.appendChild(cb);
+        label.appendChild(text);
+
+        container.appendChild(label);
+      });
+    })
+    .catch(err => {
+      console.error("Dropdown error:", err);
+      document.getElementById('exportKeywordsList').innerHTML =
+        '<div class="keyword-list-empty">Error loading keywords</div>';
+    });
+}
+
+function exportFilteredLeads() {
+  const selected = Array.from(
+    document.querySelectorAll('#exportKeywordsList input[type="checkbox"]:checked')
+  ).map(cb => cb.value);
+
+  const fromDate = document.getElementById('fromDate').value;
+  const toDate = document.getElementById('toDate').value;
+
+  const statusBox = document.getElementById('modalStatus');
+
+  // Reset
+  statusBox.textContent = "";
+  statusBox.style.color = "red";
+
+  if (selected.length === 0) {
+    statusBox.style.color = "red"; // ❌ error
+    statusBox.textContent = "Please select at least one keyword";
+    return;
+  }
+
+  const params = new URLSearchParams();
+  params.set("keywordIds", selected.join(","));
+  if (fromDate) params.set("fromDate", fromDate);
+  if (toDate) params.set("toDate", toDate);
+
+  fetch(BASE + '/export-leads?' + params.toString())
+    .then(async res => {
+      const contentType = res.headers.get("content-type");
+
+      if (contentType && contentType.includes("application/vnd.openxmlformats")) {
+        // ✅ SUCCESS (file download)
+        statusBox.style.color = "green";
+        statusBox.textContent = "Download started...";
+
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+
+        const a = document.createElement("a");
+        a.href = url;
+        const disposition = res.headers.get("content-disposition");
+const fileNameMatch = disposition && disposition.match(/filename="(.+)"/);
+const fileName = fileNameMatch ? fileNameMatch[1] : "leads.xlsx";
+
+a.download = fileName;
+
+document.body.appendChild(a);
+a.click();
+a.remove();
+
+        setTimeout(() => closeFilterModal(), 1000);
+      } 
+      else {
+        // ❌ ERROR (no data)
+        const data = await res.json();
+        statusBox.style.color = "red";
+        statusBox.textContent = data.message || "No leads found";
+
+        setTimeout(() => {
+        statusBox.textContent = "";
+      }, 2500);
+      }
+    })
+    .catch(err => {
+      // ❌ ERROR (network/server)
+      statusBox.style.color = "red";
+      statusBox.textContent = "Export failed: " + err.message;
+
+      setTimeout(() => {
+      statusBox.textContent = "";
+    }, 2500);
+    });
+}
 
     function showLoader(text) {
       document.getElementById('loaderOverlay').style.display = 'flex';
@@ -737,6 +896,15 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
     }
     function selectAllKeywords() { document.querySelectorAll('#keywordList input[type=checkbox]').forEach(function(cb){ cb.checked = true; }); updateSelectedCount(); }
     function deselectAllKeywords() { document.querySelectorAll('#keywordList input[type=checkbox]').forEach(function(cb){ cb.checked = false; }); updateSelectedCount(); }
+    function selectAllExportKeywords() {
+  document.querySelectorAll('#exportKeywordsList input[type="checkbox"]')
+    .forEach(cb => cb.checked = true);
+}
+
+function deselectAllExportKeywords() {
+  document.querySelectorAll('#exportKeywordsList input[type="checkbox"]')
+    .forEach(cb => cb.checked = false);
+}
 
     loadKeywords();
 
@@ -826,7 +994,10 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
       window.open(BASE + '/export-leads', '_blank');
     }
 
-    function openFilterModal() { document.getElementById('filterModal').style.display = 'flex'; }
+    function openFilterModal() {
+  document.getElementById('filterModal').style.display = 'flex';
+  loadKeywordDropdown();
+}
     function closeFilterModal() { document.getElementById('filterModal').style.display = 'none'; }
 
     // ✅ applyFilters preserves existing filterCity selection

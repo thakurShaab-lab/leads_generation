@@ -8,19 +8,20 @@ function cleanPhone(phone) {
     return phone.replace(/\D/g, "")
 }
 
-async function saveLeads(data, keyword, city) {
+async function saveLeads(data, keyword, city, keywordId) {
 
     const uniqueMap = new Map()
 
     for (let lead of data) {
         const phone = cleanPhone(lead.phone)
-        if (!phone || phone.length < 8) continue
+        if (!phone || phone.length < 10) continue
 
         if (!uniqueMap.has(phone)) {
             uniqueMap.set(phone, {
                 source: lead.source,
                 name: lead.name,
                 keyword,
+                keyword_id: keywordId,
                 city,
                 rating: lead.rating || null,
                 phone,
@@ -46,7 +47,8 @@ async function saveLeads(data, keyword, city) {
                     address: sql`VALUES(address)`,
                     website: sql`VALUES(website)`,
                     keyword: sql`VALUES(keyword)`,
-                    city: sql`VALUES(city)`
+                    city: sql`VALUES(city)`,
+                    keyword_id: sql`IFNULL(${leads.keyword_id}, VALUES(keyword_id))`
                 }
             })
     }
@@ -54,13 +56,7 @@ async function saveLeads(data, keyword, city) {
     console.log(`✅ Saved ${uniqueLeads.length} leads`)
 }
 
-function chunkArray(arr, size) {
-    return Array.from({ length: Math.ceil(arr.length / size) },
-        (_, i) => arr.slice(i * size, i * size + size))
-}
-
-
-async function scrapeBusinesses(keyword, locations) {
+async function scrapeBusinesses(keyword, locations, keywordId) {
 
     const browser = await puppeteer.launch({
         headless: true,
@@ -96,7 +92,7 @@ async function scrapeBusinesses(keyword, locations) {
             console.log(`  ✅ Got ${data.length} results from ${location}`)
 
             if (data.length > 0) {
-                await saveLeads(data, keyword, location)
+                await saveLeads(data, keyword, location, keywordId)
             } else {
                 console.log(`  ⚠️ No data found for ${location}`)
             }
