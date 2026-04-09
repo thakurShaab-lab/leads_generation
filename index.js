@@ -356,6 +356,8 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
       { header: "Keyword", key: "keyword", width: 25 },
       { header: "City", key: "city", width: 20 },
       { header: "Phone", key: "phone", width: 20 },
+      { header: "Country Code", key: "country_code", width: 15 },
+      { header: "Dial Code", key: "dial_code", width: 15 },
       { header: "Website", key: "website", width: 35 },
       { header: "Date", key: "date", width: 25 },
     ]
@@ -366,6 +368,8 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
         keyword: l.keyword || "",
         city: l.city || "",
         phone: l.phone || "",
+        country_code: l.country_code || "",
+        dial_code: l.dial_code || "",
         website: l.website || "",
         date: l.created_at ? new Date(l.created_at).toLocaleString("en-IN") : "",
       })

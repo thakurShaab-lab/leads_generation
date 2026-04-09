@@ -2,10 +2,38 @@ const puppeteer = require('puppeteer')
 const db = require("./db")
 const { leads } = require("./schema")
 const { sql } = require('drizzle-orm')
+const countries = require("i18n-iso-countries")
+countries.registerLocale(require("i18n-iso-countries/langs/en.json"))
 
 function cleanPhone(phone) {
     if (!phone) return null
     return phone.replace(/\D/g, "")
+}
+
+function extractCountryInfo(phone, address) {
+    let dial_code = null
+    let country_code = null
+
+    if (phone) {
+        const match = phone.match(/\+\d{1,3}/)
+        if (match) {
+            dial_code = match[0]
+        }
+    }
+
+    if (address) {
+        const parts = address.split(",").map(p => p.trim())
+        const lastPart = parts[parts.length - 1]
+
+        if (lastPart) {
+            const code = countries.getAlpha2Code(lastPart, "en")
+            if (code) {
+                country_code = code
+            }
+        }
+    }
+
+    return { country_code, dial_code }
 }
 
 async function saveLeads(data, keyword, city, keywordId) {
@@ -13,6 +41,7 @@ async function saveLeads(data, keyword, city, keywordId) {
     const uniqueMap = new Map()
 
     for (let lead of data) {
+        const rawPhone = lead.phone
         const phone = cleanPhone(lead.phone)
         if (!phone || phone.length < 10) continue
 
@@ -27,6 +56,8 @@ async function saveLeads(data, keyword, city, keywordId) {
                 phone,
                 address: lead.address,
                 website: lead.website,
+                country_code: lead.country_code,
+                dial_code: lead.dial_code,
             })
         }
     }
@@ -48,7 +79,9 @@ async function saveLeads(data, keyword, city, keywordId) {
                     website: sql`VALUES(website)`,
                     keyword: sql`VALUES(keyword)`,
                     city: sql`VALUES(city)`,
-                    keyword_id: sql`IFNULL(${leads.keyword_id}, VALUES(keyword_id))`
+                    keyword_id: sql`IFNULL(${leads.keyword_id}, VALUES(keyword_id))`,
+                    country_code: sql`VALUES(country_code)`,
+                    dial_code: sql`VALUES(dial_code)`,
                 }
             })
     }
@@ -147,7 +180,7 @@ async function scrapeGoogleMaps(page, keyword, location) {
                 timeout: 30000
             })
 
-            await page.waitForSelector("h1.DUwDvf", { timeout: 8000 }).catch(() => {})
+            await page.waitForSelector("h1.DUwDvf", { timeout: 8000 }).catch(() => { })
 
             const data = await page.evaluate(() => {
 
@@ -161,9 +194,13 @@ async function scrapeGoogleMaps(page, keyword, location) {
             })
 
             if (data.name) {
+                const { country_code, dial_code } = extractCountryInfo(data.phone, data.address)
+                console.log(`  ✅ ${data.name} | ${data.phone} | ${data.address} | ${data.website} | ${country_code} | ${dial_code}`)
                 results.push({
                     source: "Google Maps",
-                    ...data
+                    ...data,
+                    country_code,
+                    dial_code
                 })
             }
 

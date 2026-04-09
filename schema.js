@@ -32,6 +32,8 @@ const leads = mysqlTable(
         phone: varchar("phone", { length: 20 }).notNull(),
         address: varchar("address", { length: 500 }),
         website: varchar("website", { length: 255 }),
+        country_code: varchar("country_code", { length: 10 }),
+        dial_code: varchar("dial_code", { length: 10 }),
         created_at: timestamp("created_at").defaultNow().notNull(),
     },
     (table) => {
