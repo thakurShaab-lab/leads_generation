@@ -3,7 +3,7 @@
 const express = require("express")
 const cors = require("cors")
 const db = require("./db")
-const { sql, eq, gte, lte, and, like, inArray } = require("drizzle-orm")
+const { sql, eq, gte, lte, and, like, inArray, desc } = require("drizzle-orm")
 const ExcelJS = require("exceljs")
 const scrapeBusinesses = require("./scrapper")
 const { leads, keywords, admin } = require("./schema")
@@ -11,6 +11,17 @@ const crypto = require("crypto")
 
 const app = express()
 const PORT = 3003
+
+// Last-resort backstop: the scrape routes fire background work that isn't
+// awaited by the request handler (so the HTTP response can return
+// immediately). An uncaught error in that background work is an unhandled
+// rejection, and Node kills the whole process on those by default - silently
+// taking down the entire dashboard/server, not just the one scrape. Each
+// scrape loop already catches its own errors; this only guards whatever
+// isn't covered.
+process.on("unhandledRejection", (err) => {
+  console.error("❌ Unhandled rejection (server kept running):", err)
+})
 
 
 const ALLOWED_IPS = [
@@ -100,7 +111,11 @@ app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
 app.use((req, res, next) => {
-  if (!req.path.startsWith(BASE_PATH)) {
+  // Plain startsWith(BASE_PATH) treats "/leads-count" as already prefixed,
+  // since it happens to start with the literal characters "/leads" - it
+  // isn't, it's a distinct route ("/leads-count", not "/leads/count"), so it
+  // was never getting the "/leads" prefix it actually needed.
+  if (req.path !== BASE_PATH && !req.path.startsWith(BASE_PATH + "/")) {
     req.url = BASE_PATH + req.url
   }
   next()
@@ -191,7 +206,7 @@ app.get(BASE_PATH + "/get-keywords", requireAuth, async (req, res) => {
   }
 })
 
-app.get("/leads-count", async (req, res) => {
+app.get(BASE_PATH + "/leads-count", async (req, res) => {
   try {
     const result = await db.select({ count: sql`count(*)` }).from(leads)
     res.json({ count: Number(result[0].count) })
@@ -220,7 +235,14 @@ app.post(BASE_PATH + "/run-keyword-scraper", requireAuth, async (req, res) => {
         const parsed = parseKeyword(k.keyword)
         if (!parsed) { console.log(`Skipping "${k.keyword}" - invalid format`); continue }
         console.log(`Scraping: ${k.keyword}`)
-        await scrapeBusinesses(parsed.keywordPart, [parsed.locationPart], k.id)
+        try {
+          await scrapeBusinesses(parsed.keywordPart, [parsed.locationPart], k.id)
+        } catch (err) {
+          // A rejection here (e.g. puppeteer.launch() itself failing) would
+          // otherwise be an unhandled rejection that crashes the whole
+          // process, silently killing every keyword still queued behind it.
+          console.error(`  ❌ "${k.keyword}" failed, continuing with the rest:`, err.message)
+        }
       }
       console.log("All keyword scraping done")
     })()
@@ -230,11 +252,41 @@ app.post(BASE_PATH + "/run-keyword-scraper", requireAuth, async (req, res) => {
   }
 })
 
+function parseFilterNumber(value) {
+  if (value === undefined || value === null || value === "") return null
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
+function parseSearchFilters(rawFilters) {
+  const filters = rawFilters && typeof rawFilters === "object" ? rawFilters : {}
+  const result = {
+    minRating: parseFilterNumber(filters.minRating),
+    maxRating: parseFilterNumber(filters.maxRating),
+    minReviews: parseFilterNumber(filters.minReviews),
+    maxReviews: parseFilterNumber(filters.maxReviews),
+  }
+  if (result.minRating != null && result.maxRating != null && result.minRating > result.maxRating) {
+    throw new Error("Minimum rating cannot be greater than maximum rating")
+  }
+  if (result.minReviews != null && result.maxReviews != null && result.minReviews > result.maxReviews) {
+    throw new Error("Minimum reviews cannot be greater than maximum reviews")
+  }
+  return result
+}
+
 app.post(BASE_PATH + "/run-selected-keywords", requireAuth, async (req, res) => {
   try {
-    const { keywords: selectedKeywords } = req.body
+    const { keywords: selectedKeywords, filters: rawFilters } = req.body
     if (!Array.isArray(selectedKeywords) || selectedKeywords.length === 0)
       return res.json({ success: false, message: "No keywords provided" })
+
+    let filters
+    try {
+      filters = parseSearchFilters(rawFilters)
+    } catch (err) {
+      return res.json({ success: false, message: err.message })
+    }
 
     const dbKeywords = await db.select().from(keywords);
     const keywordMap = {};
@@ -254,8 +306,15 @@ app.post(BASE_PATH + "/run-selected-keywords", requireAuth, async (req, res) => 
     (async () => {
       for (const item of valid) {
         console.log(`Scraping: ${item.keyword}`)
-        await scrapeBusinesses(item.keywordPart, [item.locationPart], item.keywordId)
-        console.log(`Done: ${item.keyword}`)
+        try {
+          await scrapeBusinesses(item.keywordPart, [item.locationPart], item.keywordId, filters)
+          console.log(`Done: ${item.keyword}`)
+        } catch (err) {
+          // See the identical guard in /run-keyword-scraper - without this,
+          // one failure here is an unhandled rejection that crashes the
+          // whole process, silently killing every keyword still queued.
+          console.error(`  ❌ "${item.keyword}" failed, continuing with the rest:`, err.message)
+        }
       }
       console.log("Selected keyword scraping done")
     })()
@@ -280,8 +339,14 @@ app.post(BASE_PATH + "/run-manual-scrape", requireAuth, async (req, res) => {
     res.json({ success: true, message: `Scraping "${keyword}" in ${locations.join(", ")}...` });
     (async () => {
       console.log(`Manual scrape: ${finalKeyword} in ${locations.join(", ")}`)
-      await scrapeBusinesses(finalKeyword, locations, null)
-      console.log(`Manual scrape done`)
+      try {
+        await scrapeBusinesses(finalKeyword, locations, null)
+        console.log(`Manual scrape done`)
+      } catch (err) {
+        // Same unhandled-rejection-crashes-the-process guard as the other
+        // scrape routes.
+        console.error(`  ❌ Manual scrape failed:`, err.message)
+      }
     })()
   } catch (err) {
     res.status(500).json({ success: false, message: err.message })
@@ -355,6 +420,8 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
       { header: "Name", key: "name", width: 30 },
       { header: "Keyword", key: "keyword", width: 25 },
       { header: "City", key: "city", width: 20 },
+      { header: "Rating", key: "rating", width: 12 },
+      { header: "Reviews", key: "reviews_count", width: 12 },
       { header: "Phone", key: "phone", width: 20 },
       { header: "Country Code", key: "country_code", width: 15 },
       { header: "Dial Code", key: "dial_code", width: 15 },
@@ -367,6 +434,8 @@ app.get(BASE_PATH + "/export-leads", requireAuth, async (req, res) => {
         name: l.name || "",
         keyword: l.keyword || "",
         city: l.city || "",
+        rating: l.rating != null ? Number(l.rating) : "",
+        reviews_count: l.reviews_count != null ? l.reviews_count : "",
         phone: l.phone || "",
         country_code: l.country_code || "",
         dial_code: l.dial_code || "",
@@ -469,8 +538,11 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
     const city = (l.city || "").replace(/</g, "&lt;")
     const phone = (l.phone || "").replace(/</g, "&lt;")
     const website = l.website ? `<a href="${l.website}" target="_blank">Visit</a>` : "&mdash;"
+    const rating = l.rating != null ? Number(l.rating).toFixed(1) : "&mdash;"
+    const reviews = l.reviews_count != null ? l.reviews_count : "&mdash;"
+    const employees = l.employee_range || (l.employee_count != null ? String(l.employee_count) : "Unknown")
     const date = l.created_at ? new Date(l.created_at).toLocaleString("en-IN") : ""
-    return `<tr><td>${num}</td><td>${name || "&mdash;"}</td><td>${kw || "&mdash;"}</td><td>${city || "&mdash;"}</td><td>${phone || "&mdash;"}</td><td>${website}</td><td>${date}</td></tr>`
+    return `<tr><td>${num}</td><td>${name || "&mdash;"}</td><td>${kw || "&mdash;"}</td><td>${city || "&mdash;"}</td><td>${rating}</td><td>${reviews}</td><td>${employees}</td><td>${phone || "&mdash;"}</td><td>${website}</td><td>${date}</td></tr>`
   }).join("")
 
   const cityOptions = citiesList.map(city =>
@@ -520,6 +592,9 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
     .col { flex: 1; min-width: 280px; }
     input[type=text], input:not([type]), textarea, select { padding: 9px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 8px; }
     input[type=date] { padding: 9px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 8px; }
+    .filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 4px; }
+    .filter-label { display: block; font-size: 12px; color: #666; margin-bottom: 3px; }
+    select:disabled { background: #f5f5f5; color: #999; cursor: not-allowed; }
     button { padding: 9px 18px; background: #111; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; margin-right: 6px; margin-top: 4px; }
     button:hover { background: #333; }
     button.secondary { background: #555; } button.danger { background: #c0392b; } button.success { background: #27ae60; }
@@ -588,6 +663,29 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
       <div class="keyword-list" id="keywordList">
         <div class="keyword-list-empty">Loading...</div>
       </div>
+
+      <hr class="divider" style="margin:14px 0;">
+      <div class="section-label">Search Filters &nbsp;<span style="font-weight:normal;color:#999;">(optional &mdash; leave blank for no restriction)</span></div>
+      <div class="filter-grid">
+        <div>
+          <label class="filter-label">Rating &ge;</label>
+          <input type="number" id="filterMinRating" min="0" max="5" step="0.1" placeholder="e.g. 4.0" />
+        </div>
+        <div>
+          <label class="filter-label">Rating &le;</label>
+          <input type="number" id="filterMaxRating" min="0" max="5" step="0.1" placeholder="e.g. 5.0" />
+        </div>
+        <div>
+          <label class="filter-label">Reviews &ge;</label>
+          <input type="number" id="filterMinReviews" min="0" step="1" placeholder="e.g. 100" />
+        </div>
+        <div>
+          <label class="filter-label">Reviews &le;</label>
+          <input type="number" id="filterMaxReviews" min="0" step="1" placeholder="e.g. 1000" />
+        </div>
+      </div>
+      <div style="font-size:12px;color:#999;margin:-4px 0 8px;">Employee count is shown in the results below when it can be found on the business's own website &mdash; not every business publishes it.</div>
+
       <div class="kw-actions">
         <button onclick="searchSelectedKeywords()">&#128269; Search Selected</button>
         <button class="danger" onclick="deleteSelectedKeyword()">&#128465; Delete</button>
@@ -628,8 +726,8 @@ function renderHTML(data, totalLeads, page, totalPages, keyword, locationInput, 
     </div>
     ${filterBadgeHTML}
     <table>
-      <tr><th>#</th><th>Name</th><th>Keyword</th><th>City</th><th>Phone</th><th>Website</th><th>Date</th></tr>
-      ${data.length === 0 ? '<tr><td colspan="6" style="text-align:center;color:#888;padding:30px;">No leads found</td></tr>' : rows}
+      <tr><th>#</th><th>Name</th><th>Keyword</th><th>City</th><th>Rating</th><th>Reviews</th><th>Employees</th><th>Phone</th><th>Website</th><th>Date</th></tr>
+      ${data.length === 0 ? '<tr><td colspan="10" style="text-align:center;color:#888;padding:30px;">No leads found</td></tr>' : rows}
     </table>
     <div class="pagination">${pageLinks}</div>
   </div>
@@ -930,12 +1028,37 @@ function deselectAllExportKeywords() {
         .catch(function(e){ status.style.color = 'red'; status.textContent = 'Network error: ' + e.message; });
     }
 
+    function readFilterNumber(id) {
+      var el = document.getElementById(id);
+      if (!el) return null;
+      var val = el.value.trim();
+      if (val === '') return null;
+      var num = Number(val);
+      return isNaN(num) ? null : num;
+    }
+
+    function getSearchFilters() {
+      return {
+        minRating: readFilterNumber('filterMinRating'),
+        maxRating: readFilterNumber('filterMaxRating'),
+        minReviews: readFilterNumber('filterMinReviews'),
+        maxReviews: readFilterNumber('filterMaxReviews')
+      };
+    }
+
     function searchSelectedKeywords() {
       var selected = getCheckedKeywords();
       if (selected.length === 0) { showStatus('Please check at least one keyword first.', true); return; }
+      var filters = getSearchFilters();
+      if (filters.minRating != null && filters.maxRating != null && filters.minRating > filters.maxRating) {
+        showStatus('Minimum rating cannot be greater than maximum rating.', true); return;
+      }
+      if (filters.minReviews != null && filters.maxReviews != null && filters.minReviews > filters.maxReviews) {
+        showStatus('Minimum reviews cannot be greater than maximum reviews.', true); return;
+      }
       var label = 'Scraping ' + selected.length + ' keyword' + (selected.length > 1 ? 's' : '');
       scrapeWithPolling(function() {
-        return fetch(BASE + '/run-selected-keywords', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keywords: selected }) }).then(function(r){ return r.json(); });
+        return fetch(BASE + '/run-selected-keywords', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keywords: selected, filters: filters }) }).then(function(r){ return r.json(); });
       }, label);
     }
 
@@ -1059,7 +1182,9 @@ app.get(["/", BASE_PATH], requireAuth, async (req, res) => {
     const totalResult = await countQuery
     const totalLeads = Number(totalResult[0].count)
     const totalPages = Math.ceil(totalLeads / limit) || 1
-    const result = await query.limit(limit).offset((page - 1) * limit)
+    // created_at is a 1-second-resolution TIMESTAMP, so bulk-inserted rows
+    // routinely tie on it - id (always monotonic) breaks ties deterministically.
+    const result = await query.orderBy(desc(leads.created_at), desc(leads.id)).limit(limit).offset((page - 1) * limit)
     res.send(renderHTML(result, totalLeads, page, totalPages, keyword, locationInput, citiesList, filterCity, filterKeyword, fromDate, toDate))
   } catch (err) {
     console.error(err)
